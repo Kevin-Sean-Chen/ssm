@@ -10,7 +10,7 @@ from ssm.util import random_rotation, ensure_args_are_lists, \
     logistic, logit, one_hot, generalized_newton_studentst_dof, fit_linear_regression
 from ssm.preprocessing import interpolate_data
 from ssm.cstats import robust_ar_statistics
-from ssm.optimizers import adam, bfgs, rmsprop, sgd
+from ssm.optimizers import adam, bfgs, rmsprop, sgd, lbfgs
 import ssm.stats as stats
 
 
@@ -46,9 +46,9 @@ class Observations(object):
     def m_step(self, expectations, datas, inputs, masks, tags,
                optimizer="bfgs", **kwargs):
         """
-        If M-step cannot be done in closed form for the transitions, default to SGD.
+        If M-step cannot be done in closed form for the observations, default to SGD.
         """
-        optimizer = dict(adam=adam, bfgs=bfgs, rmsprop=rmsprop, sgd=sgd)[optimizer]
+        optimizer = dict(adam=adam, bfgs=bfgs, lbfgs=lbfgs, rmsprop=rmsprop, sgd=sgd)[optimizer]
 
         # expected log joint
         def _expected_log_joint(expectations):
@@ -71,6 +71,11 @@ class Observations(object):
     def smooth(self, expectations, data, input, tag):
         raise NotImplementedError
 
+    def hessian_expected_log_dynamics_prob(self, Ez, data, input, mask, tag=None):
+        # warnings.warn("Analytical Hessian is not implemented for this dynamics class. \
+        #                Optimization via Laplace-EM may be slow. Consider using an \
+        #                alternative posterior and inference method. ")
+        raise NotImplementedError
 
 class GaussianObservations(Observations):
     def __init__(self, K, D, M=0):
@@ -113,7 +118,11 @@ class GaussianObservations(Observations):
                             "does not work with autograd because it writes to an array. "
                             "Use DiagonalGaussian instead if you need to support missing data.")
 
-        return stats.multivariate_normal_logpdf(data[:, None, :], mus, Sigmas)
+        # stats.multivariate_normal_logpdf supports broadcasting, but we get
+        # significant performance benefit if we call it with (TxD), (D,), and (D,D)
+        # arrays as inputs
+        return np.column_stack([stats.multivariate_normal_logpdf(data, mu, Sigma)
+                               for mu, Sigma in zip(mus, Sigmas)])
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
         D, mus = self.D, self.mus
@@ -198,9 +207,9 @@ class DiagonalGaussianObservations(Observations):
         x = np.concatenate(datas)
         weights = np.concatenate([Ez for Ez, _, _ in expectations])
         for k in range(self.K):
-            self.mus[k] = np.average(x, axis=0, weights=weights[:,k])
+            self.mus[k] = np.average(x, axis=0, weights=weights[:, k])
             sqerr = (x - self.mus[k])**2
-            self._log_sigmasq[k] = np.log(np.average(sqerr, weights=weights[:,k], axis=0))
+            self._log_sigmasq[k] = np.log(np.average(sqerr, weights=weights[:, k], axis=0))
 
     def smooth(self, expectations, data, input, tag):
         """
@@ -382,7 +391,14 @@ class MultivariateStudentsTObservations(Observations):
     def log_likelihoods(self, data, input, mask, tag):
         assert np.all(mask), "MultivariateStudentsTObservations does not support missing data"
         D, mus, Sigmas, nus = self.D, self.mus, self.Sigmas, self.nus
-        return stats.multivariate_studentst_logpdf(data[:, None, :], mus, Sigmas, nus)
+
+        # stats.multivariate_studentst_logpdf supports broadcasting, but we get
+        # significant performance benefit if we call it with (TxD), (D,), (D,D), and (,)
+        # arrays as inputs
+        return np.column_stack([stats.multivariate_studentst_logpdf(data, mu, Sigma, nu)
+                               for mu, Sigma, nu in zip(mus, Sigmas, nus)])
+
+        # return stats.multivariate_studentst_logpdf(data[:, None, :], mus, Sigmas, nus)
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         """
@@ -667,27 +683,29 @@ class _AutoRegressiveObservationsBase(Observations):
         self.Vs = self.Vs[perm]
 
     def _compute_mus(self, data, input, mask, tag):
-        assert np.all(mask), "ARHMM cannot handle missing data"
+        # assert np.all(mask), "ARHMM cannot handle missing data"
+        K, M = self.K, self.M
         T, D = data.shape
-        As, bs, Vs = self.As, self.bs, self.Vs
+        As, bs, Vs, mu0s = self.As, self.bs, self.Vs, self.mu_init
 
         # Instantaneous inputs
-        mus = np.matmul(Vs[None, ...], input[self.lags:, None, :self.M, None])[:, :, :, 0]
+        mus = np.empty((K, T, D))
+        mus = []
+        for k, (A, b, V, mu0) in enumerate(zip(As, bs, Vs, mu0s)):
+            # Initial condition
+            mus_k_init = mu0 * np.zeros((self.lags, D))
 
-        # Lagged data
-        for l in range(self.lags):
-            Als = As[None, :, :, l*D:(l+1)*D]
-            lagged_data = data[self.lags-l-1:-l-1, None, :, None]
-            mus = mus + np.matmul(Als, lagged_data)[:, :, :, 0]
+            # Subsequent means are determined by the AR process
+            mus_k_ar = np.dot(input[self.lags:, :M], V.T)
+            for l in range(self.lags):
+                Al = A[:, l*D:(l + 1)*D]
+                mus_k_ar = mus_k_ar + np.dot(data[self.lags-l-1:-l-1], Al.T)
+            mus_k_ar = mus_k_ar + b
 
-        # Bias
-        mus = mus + bs
+            # Append concatenated mean
+            mus.append(np.vstack((mus_k_init, mus_k_ar)))
 
-        # Pad with the initial condition
-        mus = np.concatenate((self.mu_init * np.ones((self.lags, self.K, self.D)), mus))
-
-        assert mus.shape == (T, self.K, D)
-        return mus
+        return np.array(mus)
 
     def smooth(self, expectations, data, input, tag):
         """
@@ -696,7 +714,7 @@ class _AutoRegressiveObservationsBase(Observations):
         """
         T = expectations.shape[0]
         mask = np.ones((T, self.D), dtype=bool)
-        mus = self._compute_mus(data, input, mask, tag)
+        mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
         return (expectations[:, :, None] * mus).sum(1)
 
 
@@ -797,8 +815,15 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
         mus = self._compute_mus(data, input, mask, tag)
 
         # Compute the likelihood of the initial data and remainder separately
-        ll_init = stats.multivariate_normal_logpdf(data[:L, None, :], mus[:L], self.Sigmas_init)
-        ll_ar = stats.multivariate_normal_logpdf(data[L:, None, :], mus[L:], self.Sigmas)
+        # stats.multivariate_studentst_logpdf supports broadcasting, but we get
+        # significant performance benefit if we call it with (TxD), (D,), (D,D), and (,)
+        # arrays as inputs
+        ll_init = np.column_stack([stats.multivariate_normal_logpdf(data[:L], mu[:L], Sigma)
+                               for mu, Sigma in zip(mus, self.Sigmas_init)])
+
+        ll_ar = np.column_stack([stats.multivariate_normal_logpdf(data[L:], mu[L:], Sigma)
+                               for mu, Sigma in zip(mus, self.Sigmas)])
+
         return np.row_stack((ll_init, ll_ar))
 
     def m_step(self, expectations, datas, inputs, masks, tags, J0=None, h0=None):
@@ -858,8 +883,22 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
             resid = y[None, :, :] - yhat
             sqerr += np.einsum('tk,kti,ktj->kij', Ez, resid, resid)
             weight += np.sum(Ez, axis=0)
+        Sigmas = sqerr / weight[:, None, None] + 1e-8 * np.eye(D)
 
-        self.Sigmas = sqerr / weight[:, None, None] + 1e-8 * np.eye(D)
+        # If any states are unused, set their parameters to a perturbation of a used state
+        usage = sum([Ez.sum(0) for Ez in Ezs])
+        unused = np.where(usage < 1)[0]
+        used = np.where(usage > 1)[0]
+        if len(unused) > 0:
+            for k in unused:
+                i = npr.choice(used)
+                self.As[k] = self.As[i] + 0.01 * npr.randn(*self.As[i].shape)
+                self.Vs[k] = self.Vs[i] + 0.01 * npr.randn(*self.Vs[i].shape)
+                self.bs[k] = self.bs[i] + 0.01 * npr.randn(*self.bs[i].shape)
+                Sigmas[k] = Sigmas[i]
+
+        # Store the updated covariances
+        self.Sigmas = Sigmas
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
         D, As, bs, Vs = self.D, self.As, self.bs, self.Vs
@@ -877,6 +916,36 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
             S = np.linalg.cholesky(self.Sigmas[z]) if with_noise else 0
             return mu + np.dot(S, npr.randn(D))
+
+    def hessian_expected_log_dynamics_prob(self, Ez, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute Hessian of autoregressive obsevations with missing data."
+        assert self.lags == 1, "Does not compute Hessian of autoregressive observations with lags > 1"
+        T = data.shape[0]
+        K = self.K
+        D = self.D
+
+        # diagonal blocks, size ((T, D, D))
+        diagonal_blocks = np.zeros((T, D, D))
+
+        # initial distribution contributes a Gaussian term to first diagonal block
+        diagonal_blocks[0] = -1 * np.sum(Ez[0, :, None, None] * np.linalg.inv(self.Sigmas_init), axis=0)
+
+        # first part is transition dynamics - goes to all terms except final one
+        # E_q(z) x_{t} A_{z_t+1}.T Sigma_{z_t+1}^{-1} A_{z_t+1} x_{t}
+        inv_Sigmas = np.linalg.inv(self.Sigmas)
+        dynamics_terms = np.array([A.T@inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)]) # A^T Qinv A terms
+        diagonal_blocks[:-1] += -1 * np.sum(Ez[1:,:,None,None] * dynamics_terms[None,:], axis=1)
+
+        # second part of diagonal blocks are inverse covariance matrices - goes to all but first time bin
+        # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} x_{t+1}
+        diagonal_blocks[1:] += -1 * np.sum(Ez[1:,:,None,None] * inv_Sigmas[None,:], axis=1)
+
+        # lower diagonal blocks are (T-1,D,D):
+        # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} A_{z_t+1} x_t
+        off_diag_terms = np.array([inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)])
+        lower_diagonal_blocks = np.sum(Ez[1:,:,None,None] * off_diag_terms[None,:], axis=1)
+
+        return diagonal_blocks, lower_diagonal_blocks
 
 
 class AutoRegressiveObservationsNoInput(AutoRegressiveObservations):
@@ -978,7 +1047,7 @@ class AutoRegressiveDiagonalNoiseObservations(AutoRegressiveObservations):
 
     def log_likelihoods(self, data, input, mask, tag):
         assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
-        mus = self._compute_mus(data, input, mask, tag)
+        mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
 
         # Compute the likelihood of the initial data and remainder separately
         L = self.lags
@@ -1207,8 +1276,16 @@ class _RobustAutoRegressiveObservationsMixin(object):
 
         # Compute the likelihood of the initial data and remainder separately
         L = self.lags
-        ll_init = stats.multivariate_normal_logpdf(data[:L, None, :], mus[:L], self.Sigmas_init)
-        ll_ar = stats.multivariate_studentst_logpdf(data[L:, None, :], mus[L:], self.Sigmas, self.nus)
+        # Compute the likelihood of the initial data and remainder separately
+        # stats.multivariate_studentst_logpdf supports broadcasting, but we get
+        # significant performance benefit if we call it with (TxD), (D,), (D,D), and (,)
+        # arrays as inputs
+        ll_init = np.column_stack([stats.multivariate_normal_logpdf(data[:L], mu[:L], Sigma)
+                               for mu, Sigma in zip(mus, self.Sigmas_init)])
+
+        ll_ar = np.column_stack([stats.multivariate_studentst_logpdf(data[L:], mu[L:], Sigma, nu)
+                               for mu, Sigma, nu in zip(mus, self.Sigmas, self.nus)])
+
         return np.row_stack((ll_init, ll_ar))
 
     def m_step(self, expectations, datas, inputs, masks, tags, num_em_iters=1, J0=None, h0=None):
@@ -1301,10 +1378,12 @@ class _RobustAutoRegressiveObservationsMixin(object):
         E_logtaus = np.zeros(K)
         weights = np.zeros(K)
         for (Ez, _, _,), data, input, mask, tag in zip(expectations, datas, inputs, masks, tags):
-            # nu: (K,)  mus: (K, D)  Sigmas: (K, D, D)  y: (T, D)  -> tau: (T, K)
-            mus = self._compute_mus(data, input, mask, tag)
+            # nu: (K,)  mus: (T, K, D)  Sigmas: (K, D, D)  y: (T, D)  -> tau: (T, K)
+            mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
+
             alpha = self.nus/2 + D/2
             sqrt_Sigma = np.linalg.cholesky(self.Sigmas)
+            # TODO: Performance could be improved by iterating over K outside batch_mahalanobis
             beta = self.nus/2 + 1/2 * stats.batch_mahalanobis(sqrt_Sigma, data[L:, None, :] - mus[L:])
 
             E_taus += np.sum(Ez[L:, :] * alpha / beta, axis=0)
@@ -1419,7 +1498,7 @@ class AltRobustAutoRegressiveDiagonalNoiseObservations(AutoRegressiveDiagonalNoi
 
     def log_likelihoods(self, data, input, mask, tag):
         assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
-        mus = self._compute_mus(data, input, mask, tag)
+        mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
 
         # Compute the likelihood of the initial data and remainder separately
         L = self.lags
@@ -1493,8 +1572,9 @@ class AltRobustAutoRegressiveDiagonalNoiseObservations(AutoRegressiveDiagonalNoi
         E_logtaus = np.zeros((K, D))
         weights = np.zeros(K)
         for (Ez, _, _,), data, input, mask, tag in zip(expectations, datas, inputs, masks, tags):
-            # nu: (K,D)  mus: (K, D)  sigmas: (K, D)  y: (T, D)  -> w: (T, K, D)
-            mus = self._compute_mus(data, input, mask, tag)
+            # nu: (K,D)  mus: (T, K, D)  sigmas: (K, D)  y: (T, D)  -> w: (T, K, D)
+            mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
+
             alpha = self.nus/2 + 1/2
             beta = self.nus/2 + 1/2 * (data[L:, None, :] - mus[L:])**2 / self.sigmasq
 

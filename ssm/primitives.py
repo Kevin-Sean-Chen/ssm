@@ -12,7 +12,9 @@ from ssm.cstats import _blocks_to_bands_lower, _blocks_to_bands_upper, \
                        _transpose_banded, vjp_cholesky_banded_lower, \
                        _vjp_solve_banded_A, _vjp_solveh_banded_A
 
-from ssm.messages import forward_pass, backward_pass, backward_sample, grad_hmm_normalizer
+from ssm.messages import forward_pass, backward_pass, \
+                         backward_sample, grad_hmm_normalizer, \
+                         compute_stationary_expected_joints
 
 to_c = lambda arr: np.copy(getval(arr), 'C') if not arr.flags['C_CONTIGUOUS'] else getval(arr)
 
@@ -58,7 +60,7 @@ defvjp(hmm_normalizer,
        partial(_make_grad_hmm_normalizer, 2))
 
 
-def hmm_expected_states(log_pi0, log_Ps, ll):
+def hmm_expected_states(log_pi0, log_Ps, ll, memlimit=2**31):
     T, K = ll.shape
 
     # Make sure everything is C contiguous
@@ -73,14 +75,30 @@ def hmm_expected_states(log_pi0, log_Ps, ll):
     betas = np.zeros((T, K))
     backward_pass(log_Ps, ll, betas)
 
+    # Compute E[z_t] for t = 1, ..., T
     expected_states = alphas + betas
     expected_states -= logsumexp(expected_states, axis=1, keepdims=True)
     expected_states = np.exp(expected_states)
 
-    expected_joints = alphas[:-1,:,None] + betas[1:,None,:] + ll[1:,None,:] + log_Ps
-    expected_joints -= expected_joints.max((1,2))[:,None, None]
-    expected_joints = np.exp(expected_joints)
-    expected_joints /= expected_joints.sum((1,2))[:,None,None]
+    # Compute E[z_t, z_{t+1}] for t = 1, ..., T-1
+    # Note that this is an array of size T*K*K, which can be quite large.
+    # To be a bit more frugal with memory, first check if the given log_Ps
+    # are TxKxK.  If so, instantiate the full expected joints as well, since
+    # we will need them for the M-step.  However, if log_Ps is 1xKxK then we
+    # know that the transition matrix is stationary, and all we need for the
+    # M-step is the sum of the expected joints.
+    stationary = (log_Ps.shape[0] == 1)
+    if not stationary:
+        expected_joints = alphas[:-1,:,None] + betas[1:,None,:] + ll[1:,None,:] + log_Ps
+        expected_joints -= expected_joints.max((1,2))[:,None, None]
+        expected_joints = np.exp(expected_joints)
+        expected_joints /= expected_joints.sum((1,2))[:,None,None]
+
+    else:
+        # Compute the sum over time axis of the expected joints
+        expected_joints = np.zeros((K, K))
+        compute_stationary_expected_joints(alphas, betas, ll, log_Ps[0], expected_joints)
+        expected_joints = expected_joints[None, :, :]
 
     return expected_states, expected_joints, normalizer
 
@@ -138,11 +156,17 @@ def viterbi(log_pi0, log_Ps, ll):
     """
     T, K = ll.shape
 
+    # Check if the transition matrices are stationary or
+    # time-varying (hetero)
+    hetero = (log_Ps.shape[0] == T-1)
+    if not hetero:
+        assert log_Ps.shape[0] == 1
+
     # Pass max-sum messages backward
     scores = np.zeros_like(ll)
     args = np.zeros_like(ll, dtype=int)
     for t in range(T-2,-1,-1):
-        vals = log_Ps[t] + scores[t+1] + ll[t+1]
+        vals = log_Ps[t * hetero] + scores[t+1] + ll[t+1]
         args[t+1] = vals.argmax(axis=1)
         scores[t] = vals.max(axis=1)
 
@@ -315,6 +339,44 @@ def vjp_solveh_banded_A(C, A_banded, b, lower=True, **kwargs):
 defvjp(solveh_banded, vjp_solveh_banded_A, vjp_solveh_banded_b)
 
 
+def blocks_to_full(J_diag, J_lower_diag):
+    T, D, _ = J_diag.shape
+    J = np.zeros((T*D, T*D))
+    for t in range(T):
+        J[t*D:(t+1)*D, t*D:(t+1)*D] = J_diag[t]
+    for t in range(T-1):
+        J[(t+1)*D:(t+2)*D, t*D:(t+1)*D] = J_lower_diag[t]
+        J[t*D:(t+1)*D, (t+1)*D:(t+2)*D] = J_lower_diag[t].T
+    return J
+
+
+# Solve and multiply symmetric block tridiagonal systems
+def solve_symm_block_tridiag(J_diag, J_lower_diag, v):
+    J_banded = blocks_to_bands(J_diag, J_lower_diag, lower=True)
+    x_flat = solveh_banded(J_banded, np.ravel(v), lower=True)
+    return np.reshape(x_flat, v.shape)
+
+
+def symm_block_tridiag_matmul(J_diag, J_lower_diag, v):
+    """
+    Compute matrix-vector product with a symmetric block
+    tridiagonal matrix J and vector v.
+    :param J_diag:          block diagonal terms of J
+    :param J_lower_diag:    lower block diagonal terms of J
+    :param v:               vector to multiply
+    :return:                J * v
+    """
+    T, D, _ = J_diag.shape
+    assert J_diag.ndim == 3 and J_diag.shape[2] == D
+    assert J_lower_diag.shape == (T-1, D, D)
+    assert v.shape == (T, D)
+
+    out = np.matmul(J_diag, v[:, :, None])[:, :, 0]
+    out[:-1] += np.matmul(np.swapaxes(J_lower_diag, -1, -2), v[1:][:, :, None])[:, :, 0]
+    out[1:] += np.matmul(J_lower_diag, v[:-1][:, :, None])[:, :, 0]
+    return out
+
+
 # LDS operations
 def convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts):
     """
@@ -372,9 +434,7 @@ def cholesky_lds(As, bs, Qi_sqrts, ms, Ri_sqrts):
 
 def solve_lds(As, bs, Qi_sqrts, ms, Ri_sqrts, v):
     J_diag, J_lower_diag, _ = convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts)
-    J_banded = blocks_to_bands(J_diag, J_lower_diag, lower=True)
-    x_flat = solveh_banded(J_banded, np.ravel(v), lower=True)
-    return np.reshape(x_flat, v.shape)
+    return solve_symm_block_tridiag(J_diag, J_lower_diag, v)
 
 
 def lds_log_probability(x, As, bs, Qi_sqrts, ms, Ri_sqrts):
@@ -388,8 +448,15 @@ def lds_log_probability(x, As, bs, Qi_sqrts, ms, Ri_sqrts):
     assert ms.shape == (T, D)
     assert Ri_sqrts.shape == (T, D, D)
 
-    # Convert to block form
-    J_diag, J_lower_diag, h = convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts)
+    return block_tridiagonal_log_probability(x,
+            *convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts))
+
+def block_tridiagonal_log_probability(x, J_diag, J_lower_diag, h):
+
+    T, D = x.shape
+    assert h.shape == (T, D)
+    assert J_diag.shape == (T, D, D)
+    assert J_lower_diag.shape == (T-1, D, D)
 
     # Convert blocks to banded form so we can capitalize on Lapack code
     J_banded = blocks_to_bands(J_diag, J_lower_diag, lower=True)
@@ -429,8 +496,18 @@ def lds_sample(As, bs, Qi_sqrts, ms, Ri_sqrts, z=None):
     assert Qi_sqrts.shape == (T-1, D, D)
     assert Ri_sqrts.shape == (T, D, D)
 
-    # Convert to block form
-    J_diag, J_lower_diag, h = convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts)
+    return block_tridiagonal_sample(
+        *convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts), z=z)
+
+
+def block_tridiagonal_sample(J_diag, J_lower_diag, h, z=None):
+    """
+    Sample a Gaussian chain graph represented by a block
+    tridiagonal precision matrix and a linear potential.
+    """
+    T, D = h.shape
+    assert J_diag.shape == (T, D, D)
+    assert J_lower_diag.shape == (T-1, D, D)
 
     # Convert blocks to banded form so we can capitalize on Lapack code
     J_banded = A_banded = blocks_to_bands(J_diag, J_lower_diag, lower=True)
@@ -460,10 +537,11 @@ def lds_mean(As, bs, Qi_sqrts, ms, Ri_sqrts):
     assert Ri_sqrts.shape == (T, D, D)
 
     # Convert to block form
-    J_diag, J_lower_diag, h = convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts)
+    return block_tridiagonal_mean(
+        *convert_lds_to_block_tridiag(As, bs, Qi_sqrts, ms, Ri_sqrts), lower=True).reshape((T,D))
 
+
+def block_tridiagonal_mean(J_diag, J_lower_diag, h, lower=True):
     # Convert blocks to banded form so we can capitalize on Lapack code
-    J_banded = blocks_to_bands(J_diag, J_lower_diag, lower=True)
-
-    return solveh_banded(J_banded, h.ravel(), lower=True).reshape((T, D))
-
+    return solveh_banded(
+        blocks_to_bands(J_diag, J_lower_diag, lower=lower), h.ravel(), lower=lower)
